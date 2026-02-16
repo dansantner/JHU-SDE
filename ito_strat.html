@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Itô vs Stratonovich</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a1a; }
+  input[type="range"] {
+    -webkit-appearance: none; appearance: none;
+    height: 4px; background: rgba(255,255,255,0.15); border-radius: 2px; outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #7dd3fc; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+function gaussianRandom() {
+  let u, v, s;
+  do {
+    u = Math.random() * 2 - 1;
+    v = Math.random() * 2 - 1;
+    s = u * u + v * v;
+  } while (s >= 1 || s === 0);
+  return u * Math.sqrt(-2 * Math.log(s) / s);
+}
+
+function generatePath(T, N) {
+  const dt = T / N;
+  const sqrtDt = Math.sqrt(dt);
+  const times = [0];
+  const B = [0];
+  let itoNum = 0;
+  let stratNum = 0;
+  const itoNumerical = [0];
+  const stratNumerical = [0];
+  const itoAnalytical = [0];
+  const stratAnalytical = [0];
+
+  for (let i = 0; i < N; i++) {
+    const dW = sqrtDt * gaussianRandom();
+    const Bprev = B[B.length - 1];
+    const Bnext = Bprev + dW;
+    B.push(Bnext);
+    times.push((i + 1) * dt);
+
+    // Itô: left endpoint
+    itoNum += Bprev * dW;
+    // Stratonovich: midpoint
+    stratNum += 0.5 * (Bprev + Bnext) * dW;
+
+    itoNumerical.push(itoNum);
+    stratNumerical.push(stratNum);
+
+    const t = (i + 1) * dt;
+    itoAnalytical.push(0.5 * Bnext * Bnext - 0.5 * t);
+    stratAnalytical.push(0.5 * Bnext * Bnext);
+  }
+
+  return { times, B, itoNumerical, stratNumerical, itoAnalytical, stratAnalytical };
+}
+
+function ItoVsStrat() {
+  const topCanvasRef = useRef(null);
+  const botCanvasRef = useRef(null);
+  const animRef = useRef(null);
+  const pathRef = useRef(null);
+  const frameRef = useRef(0);
+
+  const [T, setT] = useState(5);
+  const [N, setN] = useState(2000);
+  const [speed, setSpeed] = useState(8);
+  const [running, setRunning] = useState(false);
+  const [showAnalytical, setShowAnalytical] = useState(true);
+  const [done, setDone] = useState(false);
+
+  const speedRef = useRef(speed);
+  const runningRef = useRef(running);
+  const showAnalyticalRef = useRef(showAnalytical);
+  useEffect(() => { speedRef.current = speed; }, [speed]);
+  useEffect(() => { runningRef.current = running; }, [running]);
+  useEffect(() => { showAnalyticalRef.current = showAnalytical; }, [showAnalytical]);
+
+  const W = 760;
+  const H_TOP = 260;
+  const H_BOT = 320;
+  const PAD = { left: 64, right: 24, top: 28, bottom: 36 };
+
+  const newPath = useCallback(() => {
+    const path = generatePath(T, N);
+    pathRef.current = path;
+    frameRef.current = 0;
+    setDone(false);
+    setRunning(true);
+  }, [T, N]);
+
+  useEffect(() => { newPath(); }, []);
+
+  const drawAxes = (ctx, w, h, xMin, xMax, yMin, yMax, ylabel) => {
+    const plotW = w - PAD.left - PAD.right;
+    const plotH = h - PAD.top - PAD.bottom;
+    const toX = v => PAD.left + (v - xMin) / (xMax - xMin) * plotW;
+    const toY = v => PAD.top + (1 - (v - yMin) / (yMax - yMin)) * plotH;
+
+    // grid
+    ctx.strokeStyle = "rgba(255,255,255,0.06)";
+    ctx.lineWidth = 1;
+    const nxTicks = 5;
+    for (let i = 0; i <= nxTicks; i++) {
+      const v = xMin + (xMax - xMin) * i / nxTicks;
+      const x = toX(v);
+      ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, h - PAD.bottom); ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.font = "11px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText(v.toFixed(1), x, h - PAD.bottom + 14);
+    }
+    const nyTicks = 4;
+    for (let i = 0; i <= nyTicks; i++) {
+      const v = yMin + (yMax - yMin) * i / nyTicks;
+      const y = toY(v);
+      ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(w - PAD.right, y); ctx.stroke();
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.font = "11px monospace";
+      ctx.textAlign = "right";
+      ctx.fillText(v.toFixed(1), PAD.left - 8, y + 4);
+    }
+    // zero line
+    if (yMin < 0 && yMax > 0) {
+      ctx.strokeStyle = "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(PAD.left, toY(0)); ctx.lineTo(w - PAD.right, toY(0)); ctx.stroke();
+    }
+
+    // y label
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.font = "12px monospace";
+    ctx.textAlign = "center";
+    ctx.translate(14, h / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.fillText(ylabel, 0, 0);
+    ctx.restore();
+
+    return { toX, toY, plotW, plotH };
+  };
+
+  const drawLine = (ctx, times, values, n, toX, toY, color, width) => {
+    if (n < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width || 1.5;
+    ctx.beginPath();
+    ctx.moveTo(toX(times[0]), toY(values[0]));
+    for (let i = 1; i < n; i++) {
+      ctx.lineTo(toX(times[i]), toY(values[i]));
+    }
+    ctx.stroke();
+  };
+
+  const drawDashedLine = (ctx, times, values, n, toX, toY, color) => {
+    if (n < 2) return;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath();
+    ctx.moveTo(toX(times[0]), toY(values[0]));
+    for (let i = 1; i < n; i++) {
+      ctx.lineTo(toX(times[i]), toY(values[i]));
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+
+  useEffect(() => {
+    const step = () => {
+      const path = pathRef.current;
+      if (!path) { animRef.current = requestAnimationFrame(step); return; }
+
+      if (runningRef.current && frameRef.current < path.times.length) {
+        frameRef.current = Math.min(frameRef.current + speedRef.current, path.times.length);
+        if (frameRef.current >= path.times.length) {
+          setDone(true);
+          setRunning(false);
+        }
+      }
+
+      const n = Math.floor(frameRef.current);
+      if (n < 1) { animRef.current = requestAnimationFrame(step); return; }
+
+      // compute ranges
+      const bSlice = path.B.slice(0, n);
+      const allIntegrals = [
+        ...path.itoNumerical.slice(0, n),
+        ...path.stratNumerical.slice(0, n),
+        ...path.itoAnalytical.slice(0, n),
+        ...path.stratAnalytical.slice(0, n)
+      ];
+      const bMin = Math.min(...bSlice);
+      const bMax = Math.max(...bSlice);
+      const bPad = Math.max(0.5, (bMax - bMin) * 0.15);
+      const intMin = Math.min(...allIntegrals);
+      const intMax = Math.max(...allIntegrals);
+      const intPad = Math.max(0.5, (intMax - intMin) * 0.15);
+      const tMax = path.times[n - 1];
+      const xMax = Math.max(1, tMax);
+
+      // --- Top canvas: Brownian motion ---
+      const topCtx = topCanvasRef.current.getContext("2d");
+      topCtx.fillStyle = "#0a0a1a";
+      topCtx.fillRect(0, 0, W, H_TOP);
+      const top = drawAxes(topCtx, W, H_TOP, 0, xMax, bMin - bPad, bMax + bPad, "B(t)");
+      drawLine(topCtx, path.times, path.B, n, top.toX, top.toY, "#7dd3fc", 1.8);
+      // dot
+      const lx = top.toX(path.times[n - 1]);
+      const ly = top.toY(path.B[n - 1]);
+      topCtx.fillStyle = "#7dd3fc";
+      topCtx.beginPath(); topCtx.arc(lx, ly, 4, 0, Math.PI * 2); topCtx.fill();
+      // label
+      topCtx.fillStyle = "rgba(255,255,255,0.5)";
+      topCtx.font = "11px monospace";
+      topCtx.textAlign = "left";
+      topCtx.fillText(`t = ${path.times[n-1].toFixed(2)}   B = ${path.B[n-1].toFixed(3)}`, PAD.left + 8, PAD.top + 14);
+
+      // --- Bottom canvas: Integrals ---
+      const botCtx = botCanvasRef.current.getContext("2d");
+      botCtx.fillStyle = "#0a0a1a";
+      botCtx.fillRect(0, 0, W, H_BOT);
+      const bot = drawAxes(botCtx, W, H_BOT, 0, xMax, intMin - intPad, intMax + intPad, "∫ B dB");
+
+      // numerical
+      drawLine(botCtx, path.times, path.itoNumerical, n, bot.toX, bot.toY, "#f472b6", 2);
+      drawLine(botCtx, path.times, path.stratNumerical, n, bot.toX, bot.toY, "#34d399", 2);
+
+      // analytical
+      if (showAnalyticalRef.current) {
+        drawDashedLine(botCtx, path.times, path.itoAnalytical, n, bot.toX, bot.toY, "rgba(244,114,182,0.45)");
+        drawDashedLine(botCtx, path.times, path.stratAnalytical, n, bot.toX, bot.toY, "rgba(52,211,153,0.45)");
+      }
+
+      // ½t correction line
+      const corrTimes = path.times.slice(0, n);
+      const corrVals = corrTimes.map(t => 0.5 * t);
+      drawDashedLine(botCtx, corrTimes, corrVals, n, bot.toX, bot.toY, "rgba(251,191,36,0.5)");
+
+      // dots at current position
+      const ix = bot.toX(path.times[n - 1]);
+      const iy = bot.toY(path.itoNumerical[n - 1]);
+      botCtx.fillStyle = "#f472b6";
+      botCtx.beginPath(); botCtx.arc(ix, iy, 4, 0, Math.PI * 2); botCtx.fill();
+      const sx = bot.toX(path.times[n - 1]);
+      const sy = bot.toY(path.stratNumerical[n - 1]);
+      botCtx.fillStyle = "#34d399";
+      botCtx.beginPath(); botCtx.arc(sx, sy, 4, 0, Math.PI * 2); botCtx.fill();
+
+      // legend
+      const legX = W - PAD.right - 290;
+      const legY = PAD.top + 8;
+      botCtx.font = "12px monospace";
+
+      botCtx.fillStyle = "#f472b6";
+      botCtx.fillRect(legX, legY, 14, 3);
+      botCtx.fillText("Itô  ΣBⱼ ΔBⱼ", legX + 20, legY + 5);
+
+      botCtx.fillStyle = "#34d399";
+      botCtx.fillRect(legX, legY + 18, 14, 3);
+      botCtx.fillText("Strat  Σ½(Bⱼ+Bⱼ₊₁) ΔBⱼ", legX + 20, legY + 23);
+
+      botCtx.fillStyle = "rgba(251,191,36,0.7)";
+      botCtx.setLineDash([6, 4]);
+      botCtx.strokeStyle = "rgba(251,191,36,0.7)";
+      botCtx.lineWidth = 1.2;
+      botCtx.beginPath(); botCtx.moveTo(legX, legY + 37); botCtx.lineTo(legX + 14, legY + 37); botCtx.stroke();
+      botCtx.setLineDash([]);
+      botCtx.fillText("½t  (correction term)", legX + 20, legY + 41);
+
+      if (showAnalyticalRef.current) {
+        botCtx.fillStyle = "rgba(255,255,255,0.35)";
+        botCtx.fillText("dashed = analytical  ½B²−½t  |  ½B²", legX - 10, legY + 59);
+      }
+
+      // current values
+      botCtx.fillStyle = "rgba(255,255,255,0.5)";
+      botCtx.font = "11px monospace";
+      botCtx.textAlign = "left";
+      const curT = path.times[n - 1];
+      botCtx.fillText(
+        `Itô = ${path.itoNumerical[n-1].toFixed(3)}   Strat = ${path.stratNumerical[n-1].toFixed(3)}   diff = ${(path.stratNumerical[n-1] - path.itoNumerical[n-1]).toFixed(3)}   ½t = ${(0.5*curT).toFixed(3)}`,
+        PAD.left + 8, H_BOT - PAD.bottom + 30
+      );
+
+      animRef.current = requestAnimationFrame(step);
+    };
+    animRef.current = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(animRef.current);
+  }, []);
+
+  const btnStyle = {
+    background: "rgba(255,255,255,0.08)",
+    border: "1px solid rgba(255,255,255,0.2)",
+    color: "#e0e0e0",
+    padding: "8px 20px",
+    borderRadius: 6,
+    cursor: "pointer",
+    fontSize: 14
+  };
+
+  return (
+    <div style={{
+      background: "#0a0a1a", minHeight: "100vh",
+      display: "flex", flexDirection: "column", alignItems: "center",
+      padding: "24px", fontFamily: "system-ui, sans-serif", color: "#e0e0e0"
+    }}>
+      <h2 style={{ margin: "0 0 4px", color: "#7dd3fc", fontWeight: 600 }}>
+        Itô vs Stratonovich Integrals
+      </h2>
+      <p style={{
+        margin: "0 0 6px", color: "rgba(255,255,255,0.4)", fontSize: 14,
+        fontFamily: "monospace", textAlign: "center", lineHeight: 1.6
+      }}>
+        Itô: ∫B<sub>s</sub> dB<sub>s</sub> = ½B<sub>t</sub>² − ½t
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        Stratonovich: ∫B<sub>s</sub> ∘ dB<sub>s</sub> = ½B<sub>t</sub>²
+        &nbsp;&nbsp;|&nbsp;&nbsp;
+        difference = ½t
+      </p>
+      <p style={{
+        margin: "0 0 16px", color: "rgba(255,255,255,0.25)", fontSize: 12,
+        fontFamily: "monospace", textAlign: "center"
+      }}>
+        the ½t correction is the quadratic variation — the same term that makes Itô's formula differ from ordinary calculus
+      </p>
+
+      <canvas ref={topCanvasRef} width={W} height={H_TOP}
+        style={{ borderRadius: "8px 8px 0 0", border: "1px solid rgba(255,255,255,0.1)", borderBottom: "none", maxWidth: "100%", height: "auto" }} />
+      <canvas ref={botCanvasRef} width={W} height={H_BOT}
+        style={{ borderRadius: "0 0 8px 8px", border: "1px solid rgba(255,255,255,0.1)", borderTop: "1px solid rgba(255,255,255,0.05)", maxWidth: "100%", height: "auto" }} />
+
+      <div style={{
+        marginTop: 20, display: "flex", gap: 28, flexWrap: "wrap",
+        justifyContent: "center", alignItems: "flex-end"
+      }}>
+        <label style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13, color: "rgba(255,255,255,0.5)" }}>
+            T = {T.toFixed(1)}
+          </span>
+          <input type="range" min="1" max="20" step="0.5" value={T}
+            onChange={e => setT(+e.target.value)} style={{ width: 120 }} />
+        </label>
+
+        <label style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13, color: "rgba(255,255,255,0.5)" }}>
+            steps N = {N}
+          </span>
+          <input type="range" min="200" max="10000" step="200" value={N}
+            onChange={e => setN(+e.target.value)} style={{ width: 120 }} />
+        </label>
+
+        <label style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13, color: "rgba(255,255,255,0.5)" }}>
+            speed
+          </span>
+          <input type="range" min="1" max="40" step="1" value={speed}
+            onChange={e => setSpeed(+e.target.value)} style={{ width: 120 }} />
+        </label>
+
+        <label style={{
+          display: "flex", alignItems: "center", gap: 8, cursor: "pointer",
+          fontSize: 13, color: "rgba(255,255,255,0.5)"
+        }}>
+          <input type="checkbox" checked={showAnalytical}
+            onChange={e => setShowAnalytical(e.target.checked)} />
+          analytical
+        </label>
+
+        <button onClick={() => {
+          if (done) { newPath(); } else { setRunning(r => !r); }
+        }} style={{
+          ...btnStyle,
+          background: running ? "rgba(255,100,100,0.2)" : "rgba(100,255,100,0.2)"
+        }}>
+          {done ? "▶ New" : running ? "Pause" : "Play"}
+        </button>
+
+        <button onClick={newPath} style={btnStyle}>
+          New Path
+        </button>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<ItoVsStrat />);
+</script>
+</body>
+</html>
