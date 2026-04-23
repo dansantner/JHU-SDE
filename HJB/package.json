@@ -1,0 +1,15 @@
+{
+  "name": "hjb",
+  "version": "1.0.0",
+  "description": "HJB Project",
+  "license": "ISC",
+  "author": "Dan Santner",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "jstat": "^1.9.6"
+  }
+}

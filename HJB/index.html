@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HJB — Probability of Success</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a1a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; min-height: 100vh; }
+
+    input[type="range"] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 4px; background: rgba(255,255,255,0.15); border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 16px; height: 16px; border-radius: 50%; background: #7dd3fc; cursor: pointer;
+    }
+    input[type="number"] {
+      background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px; color: #e2e8f0; font-size: 14px; padding: 8px 10px; width: 100%;
+      outline: none;
+    }
+    input[type="number"]:focus { border-color: #7dd3fc; }
+    input[type="number"]::-webkit-inner-spin-button { opacity: 0.4; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ─── Normal CDF (Abramowitz & Stegun, max err ~1.5e-7) ─── */
+function erf(x) {
+  const sign = x >= 0 ? 1 : -1;
+  const t = Math.abs(x);
+  const s = 1 / (1 + 0.3275911 * t);
+  const poly = s * (0.254829592 + s * (-0.284496736 + s * (1.421413741 + s * (-1.453152027 + s * 1.061405429))));
+  return sign * (1 - poly * Math.exp(-t * t));
+}
+function normalCDF(x, mu, sigma) {
+  return 0.5 * (1 + erf((x - mu) / (sigma * Math.SQRT2)));
+}
+
+/* ─── HJB Engine ─── */
+function runEngine(currentWealth, targetWealth, months, mu_annual, sigma_annual) {
+  const N = 300;
+  const ALLOC = 10;
+  const dt = 1 / 12;
+  const mu_m    = mu_annual    * dt;
+  const sigma_m = sigma_annual * Math.sqrt(dt);
+
+  // Log-spaced wealth centers
+  const centers = new Float64Array(N + 1);
+  const logMax = Math.log(targetWealth);
+  for (let i = 1; i <= N; i++) centers[i] = Math.exp(i * logMax / N);
+  centers[0] = 0;
+
+  // Bucket boundaries
+  const bounds = new Float64Array(N + 1);
+  for (let i = 0; i < N; i++) bounds[i] = (centers[i] + centers[i + 1]) / 2;
+  bounds[N] = Infinity;
+
+  // Starting bucket
+  let start_idx = 1;
+  let min_diff = Infinity;
+  for (let i = 1; i <= N; i++) {
+    const d = Math.abs(centers[i] - currentWealth);
+    if (d < min_diff) { min_diff = d; start_idx = i; }
+  }
+
+  // Pre-compute sparse TPM: tpm[a][i] = {indices, probs} of non-zero transitions
+  const tpm = [];
+  for (let a = 0; a <= ALLOC; a++) {
+    const u = a / ALLOC;
+    const mp = u * mu_m;
+    const sp = u * sigma_m;
+    const rows = [];
+    rows.push({ idx: [0], p: [1] }); // absorbing ruin state
+    for (let i = 1; i <= N; i++) {
+      const c = centers[i];
+      const idx = [], p = [];
+      for (let j = 0; j <= N; j++) {
+        const lower_ret = j === 0 ? -Infinity : (bounds[j - 1] - c) / c;
+        const upper_ret = (bounds[j] - c) / c;
+        let prob;
+        if (sp === 0) {
+          prob = (mp > lower_ret && mp <= upper_ret) ? 1 : 0;
+        } else {
+          prob = normalCDF(upper_ret, mp, sp) - normalCDF(lower_ret, mp, sp);
+        }
+        if (prob > 1e-12) { idx.push(j); p.push(prob); }
+      }
+      rows.push({ idx, p });
+    }
+    tpm.push(rows);
+  }
+
+  // Backward induction
+  let Vcurr = new Float64Array(N + 1);
+  for (let i = 0; i <= N; i++) Vcurr[i] = centers[i] >= targetWealth ? 1 : 0;
+
+  const Vt = new Float64Array(months + 1);
+  Vt[months] = Vcurr[start_idx];
+
+  let Vnext = new Float64Array(N + 1);
+  let Policy0 = null;
+
+  for (let t = months - 1; t >= 0; t--) {
+    const pol = (t === 0) ? new Float64Array(N + 1) : null;
+    Vnext[0] = 0;
+    Vnext[N] = 1;
+
+    for (let i = 1; i < N; i++) {
+      let best_p = -1, best_a = 0;
+      for (let a = 0; a <= ALLOC; a++) {
+        const { idx, p } = tpm[a][i];
+        let ep = 0;
+        for (let k = 0; k < idx.length; k++) ep += p[k] * Vcurr[idx[k]];
+        if (ep > best_p) { best_p = ep; best_a = a; }
+      }
+      Vnext[i] = best_p;
+      if (pol) pol[i] = best_a;
+    }
+
+    Vt[t] = Vnext[start_idx];
+    if (pol) Policy0 = pol;
+    [Vcurr, Vnext] = [Vnext, Vcurr];
+  }
+
+  return {
+    probability:       Vcurr[start_idx],
+    initialAllocation: Policy0[start_idx] / ALLOC,
+    V0:      Array.from(Vcurr),
+    Policy0: Array.from(Policy0).map(v => v / ALLOC),
+    Vt:      Array.from(Vt),
+    centers: Array.from(centers),
+    N, months,
+  };
+}
+
+/* ─── Helpers ─── */
+const fmtDollar = v => '$' + Math.round(v).toLocaleString();
+const fmtPct    = (v, d = 1) => (v * 100).toFixed(d) + '%';
+
+function makeChartData(centers, values, label, color) {
+  const pts = [];
+  for (let i = 1; i < centers.length; i++) {
+    pts.push({ x: centers[i], y: values[i] });
+  }
+  return {
+    datasets: [{
+      label,
+      data: pts,
+      borderColor: color,
+      backgroundColor: color + '22',
+      borderWidth: 2,
+      pointRadius: 0,
+      showLine: true,
+      fill: true,
+      tension: 0.3,
+    }]
+  };
+}
+
+/* ─── Chart component ─── */
+function WealthChart({ title, centers, values, vertX, color, yLabel, yMax = 1.05 }) {
+  const ref = useRef(null);
+  const inst = useRef(null);
+
+  useEffect(() => {
+    if (!ref.current || !centers) return;
+    if (inst.current) inst.current.destroy();
+
+    const data = makeChartData(centers, values, yLabel, color);
+
+    // Vertical marker for current wealth
+    data.datasets.push({
+      label: 'Current Wealth',
+      data: [{ x: vertX, y: 0 }, { x: vertX, y: yMax }],
+      borderColor: '#f59e0b',
+      borderWidth: 1.5,
+      borderDash: [4, 4],
+      pointRadius: 0,
+      showLine: true,
+      fill: false,
+    });
+
+    inst.current = new Chart(ref.current, {
+      type: 'scatter',
+      data,
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => {
+                const x = fmtDollar(ctx.parsed.x);
+                const y = fmtPct(ctx.parsed.y);
+                return `${x} → ${y}`;
+              }
+            }
+          }
+        },
+        scales: {
+          x: {
+            type: 'logarithmic',
+            title: { display: true, text: 'Wealth', color: '#94a3b8', font: { size: 11 } },
+            ticks: {
+              color: '#64748b',
+              callback: v => {
+                if (v >= 1e6) return '$' + (v / 1e6).toFixed(v % 1e6 === 0 ? 0 : 1) + 'M';
+                if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+                return '$' + v;
+              }
+            },
+            grid: { color: 'rgba(255,255,255,0.05)' }
+          },
+          y: {
+            min: 0, max: yMax,
+            title: { display: true, text: yLabel, color: '#94a3b8', font: { size: 11 } },
+            ticks: {
+              color: '#64748b',
+              callback: v => fmtPct(v)
+            },
+            grid: { color: 'rgba(255,255,255,0.05)' }
+          }
+        }
+      }
+    });
+  }, [centers, values, vertX, color, yLabel, yMax]);
+
+  return (
+    <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: 10, padding: '16px', marginBottom: 16 }}>
+      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 10, fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+        {title}
+      </div>
+      <canvas ref={ref} style={{ maxHeight: 220 }} />
+    </div>
+  );
+}
+
+function TimeChart({ title, Vt, months }) {
+  const ref = useRef(null);
+  const inst = useRef(null);
+
+  useEffect(() => {
+    if (!ref.current || !Vt) return;
+    if (inst.current) inst.current.destroy();
+
+    const pts = Vt.map((v, t) => ({ x: +(t / 12).toFixed(4), y: v }));
+
+    inst.current = new Chart(ref.current, {
+      type: 'scatter',
+      data: {
+        datasets: [{
+          data: pts,
+          borderColor: '#a78bfa',
+          backgroundColor: '#a78bfa22',
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          tension: 0.3,
+          showLine: true,
+        }]
+      },
+      options: {
+        animation: false,
+        responsive: true,
+        maintainAspectRatio: true,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: {
+            title: { display: true, text: 'Time Elapsed (years)', color: '#94a3b8', font: { size: 11 } },
+            ticks: { color: '#64748b' },
+            grid: { color: 'rgba(255,255,255,0.05)' }
+          },
+          y: {
+            min: 0, max: 1.05,
+            title: { display: true, text: 'Probability of Success', color: '#94a3b8', font: { size: 11 } },
+            ticks: { color: '#64748b', callback: v => fmtPct(v) },
+            grid: { color: 'rgba(255,255,255,0.05)' }
+          }
+        }
+      }
+    });
+  }, [Vt, months]);
+
+  return (
+    <div style={{ background: 'rgba(255,255,255,0.03)', borderRadius: 10, padding: '16px', marginBottom: 16 }}>
+      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 10, fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+        {title}
+      </div>
+      <canvas ref={ref} style={{ maxHeight: 220 }} />
+    </div>
+  );
+}
+
+/* ─── Main App ─── */
+function App() {
+  const [horizon,     setHorizon]     = useState(10);
+  const [beginWealth, setBeginWealth] = useState(1500000);
+  const [endWealth,   setEndWealth]   = useState(3500000);
+  const [muScale,     setMuScale]     = useState(1.0);
+  const [result,      setResult]      = useState(null);
+  const [computing,   setComputing]   = useState(false);
+  const [error,       setError]       = useState(null);
+
+  const mu    = +(0.08 * muScale).toFixed(4);
+  const sigma = +(0.15 * muScale).toFixed(4);
+
+  const handleSolve = useCallback(() => {
+    if (beginWealth <= 0 || endWealth <= beginWealth || horizon <= 0) {
+      setError('Please check inputs: begin wealth must be positive, target must exceed begin, horizon must be positive.');
+      return;
+    }
+    setError(null);
+    setComputing(true);
+    setResult(null);
+    setTimeout(() => {
+      try {
+        const res = runEngine(beginWealth, endWealth, Math.round(horizon * 12), mu, sigma);
+        setResult(res);
+      } catch (e) {
+        setError(e.message);
+      }
+      setComputing(false);
+    }, 10);
+  }, [beginWealth, endWealth, horizon, mu, sigma]);
+
+  const pColor = result
+    ? result.probability > 0.8 ? '#4ade80'
+    : result.probability > 0.5 ? '#fbbf24'
+    : '#f87171'
+    : '#7dd3fc';
+
+  return (
+    <div style={{ maxWidth: 1100, margin: '0 auto', padding: '32px 20px' }}>
+
+      {/* Header */}
+      <div style={{ marginBottom: 32 }}>
+        <h1 style={{ fontSize: 24, fontWeight: 700, color: '#f1f5f9', letterSpacing: '-0.02em' }}>
+          HJB Probability of Success
+        </h1>
+        <p style={{ fontSize: 14, color: '#64748b', marginTop: 4 }}>
+          Hamilton–Jacobi–Bellman dynamic programming — optimal equity allocation for a wealth target
+        </p>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '280px 1fr', gap: 24, alignItems: 'start' }}>
+
+        {/* ── Controls ── */}
+        <div style={{ background: 'rgba(255,255,255,0.04)', borderRadius: 12, padding: 20, border: '1px solid rgba(255,255,255,0.08)' }}>
+          <div style={{ fontSize: 11, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 18 }}>
+            Parameters
+          </div>
+
+          <Label text="Horizon">
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                type="number" min="1" max="50" value={horizon}
+                onChange={e => setHorizon(+e.target.value)}
+                style={{ width: 80 }}
+              />
+              <span style={{ color: '#64748b', fontSize: 13 }}>years → {Math.round(horizon * 12)} mo</span>
+            </div>
+          </Label>
+
+          <Label text="Starting Wealth">
+            <input
+              type="number" min="1" value={beginWealth}
+              onChange={e => setBeginWealth(+e.target.value)}
+            />
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>{fmtDollar(beginWealth)}</div>
+          </Label>
+
+          <Label text="Target Wealth">
+            <input
+              type="number" min="1" value={endWealth}
+              onChange={e => setEndWealth(+e.target.value)}
+            />
+            <div style={{ fontSize: 11, color: '#64748b', marginTop: 3 }}>{fmtDollar(endWealth)}</div>
+          </Label>
+
+          <Label text="Return Assumptions">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: '#7dd3fc' }}>μ = {fmtPct(mu)}</span>
+              <span style={{ fontSize: 12, color: '#fb923c' }}>σ = {fmtPct(sigma)}</span>
+            </div>
+            <input
+              type="range" min="0.25" max="2.0" step="0.05" value={muScale}
+              onChange={e => setMuScale(+e.target.value)}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#475569', marginTop: 4 }}>
+              <span>2% / 3.75%</span>
+              <span>8% / 15% ●</span>
+              <span>16% / 30%</span>
+            </div>
+          </Label>
+
+          <button
+            onClick={handleSolve}
+            disabled={computing}
+            style={{
+              width: '100%', marginTop: 8, padding: '10px 0',
+              background: computing ? 'rgba(125,211,252,0.15)' : 'rgba(125,211,252,0.2)',
+              border: '1px solid rgba(125,211,252,0.4)', borderRadius: 8,
+              color: '#7dd3fc', fontWeight: 600, fontSize: 14, cursor: computing ? 'wait' : 'pointer',
+              transition: 'background 0.15s',
+            }}
+          >
+            {computing ? 'Computing…' : 'Solve'}
+          </button>
+
+          {error && (
+            <div style={{ marginTop: 10, fontSize: 12, color: '#f87171', background: 'rgba(248,113,113,0.1)', borderRadius: 6, padding: '8px 10px' }}>
+              {error}
+            </div>
+          )}
+        </div>
+
+        {/* ── Results ── */}
+        <div>
+          {!result && !computing && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 300, color: '#334155', fontSize: 14 }}>
+              Set parameters and press Solve
+            </div>
+          )}
+
+          {computing && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 300, color: '#7dd3fc', fontSize: 14 }}>
+              Running backward induction…
+            </div>
+          )}
+
+          {result && (
+            <>
+              {/* Metric strip */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 20 }}>
+                <MetricCard
+                  label="Probability of Success"
+                  value={fmtPct(result.probability, 2)}
+                  color={pColor}
+                  sub={`${fmtDollar(beginWealth)} → ${fmtDollar(endWealth)} over ${horizon} yr`}
+                />
+                <MetricCard
+                  label="Optimal Initial Equity Allocation"
+                  value={fmtPct(result.initialAllocation)}
+                  color="#a78bfa"
+                  sub={`μ = ${fmtPct(mu)}  ·  σ = ${fmtPct(sigma)}`}
+                />
+              </div>
+
+              {/* Charts */}
+              <WealthChart
+                title="Success Probability by Starting Wealth (t = 0)"
+                centers={result.centers}
+                values={result.V0}
+                vertX={beginWealth}
+                color="#7dd3fc"
+                yLabel="P(Success)"
+              />
+              <WealthChart
+                title="Optimal Equity Allocation by Starting Wealth (t = 0)"
+                centers={result.centers}
+                values={result.Policy0}
+                vertX={beginWealth}
+                color="#4ade80"
+                yLabel="Equity Allocation"
+              />
+              <TimeChart
+                title={`Optimal P(Success) vs. Time Elapsed at Starting Wealth (${fmtDollar(beginWealth)})`}
+                Vt={result.Vt}
+                months={result.months}
+              />
+            </>
+          )}
+        </div>
+
+      </div>
+
+      <div style={{ marginTop: 32, fontSize: 11, color: '#1e293b', textAlign: 'center' }}>
+        Dan Santner · JHU SDE · HJB Dynamic Programming
+      </div>
+    </div>
+  );
+}
+
+function Label({ text, children }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 6, fontWeight: 500 }}>{text}</div>
+      {children}
+    </div>
+  );
+}
+
+function MetricCard({ label, value, color, sub }) {
+  return (
+    <div style={{
+      background: 'rgba(255,255,255,0.04)', borderRadius: 10, padding: '16px 18px',
+      border: `1px solid ${color}33`,
+    }}>
+      <div style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 36, fontWeight: 700, color, fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.02em' }}>{value}</div>
+      <div style={{ fontSize: 11, color: '#475569', marginTop: 4 }}>{sub}</div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
