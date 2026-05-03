@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HJB — Jump-Adjusted Probability of Success</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a1a; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; min-height: 100vh; }
+
+    input[type="range"] {
+      -webkit-appearance: none; appearance: none;
+      width: 100%; height: 4px; background: rgba(255,255,255,0.12);
+      border-radius: 2px; outline: none; cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 16px; height: 16px; border-radius: 50%; background: #7dd3fc; cursor: pointer;
+    }
+    input[type="number"] {
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 6px; color: #e2e8f0; font-size: 13px; padding: 6px 9px; width: 100%; outline: none;
+    }
+    input[type="number"]:focus { border-color: #7dd3fc; }
+    input[type="number"]::-webkit-inner-spin-button { opacity: 0.35; }
+
+    /* Toggle switch */
+    .toggle { position: relative; display: inline-flex; align-items: center; cursor: pointer; gap: 8px; }
+    .toggle input { display: none; }
+    .toggle-track {
+      width: 34px; height: 18px; border-radius: 9px;
+      background: rgba(255,255,255,0.12); transition: background 0.2s;
+    }
+    .toggle input:checked + .toggle-track { background: #7dd3fc; }
+    .toggle-thumb {
+      position: absolute; left: 3px; top: 3px;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: #fff; transition: transform 0.2s;
+    }
+    .toggle input:checked ~ .toggle-thumb { transform: translateX(16px); }
+    .toggle-label { font-size: 12px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ─── Normal CDF  (Abramowitz & Stegun, max err ~1.5e-7) ─── */
+function erf(x) {
+  const sign = x >= 0 ? 1 : -1;
+  const t = Math.abs(x);
+  const s = 1 / (1 + 0.3275911 * t);
+  const poly = s * (0.254829592 + s * (-0.284496736 + s * (1.421413741 + s * (-1.453152027 + s * 1.061405429))));
+  return sign * (1 - poly * Math.exp(-t * t));
+}
+function normalCDF(x, mu, sigma) {
+  return 0.5 * (1 + erf((x - mu) / (sigma * Math.SQRT2)));
+}
+
+/* ─── Bucket index: inverse of log-spacing (mirrors jumpengine.js) ─── */
+function getBucketIndex(wealth, N, logMax) {
+  if (wealth <= 0) return 0;
+  if (wealth >= Math.exp(logMax)) return N;
+  const i = Math.round((Math.log(wealth) * N) / logMax);
+  return Math.max(1, Math.min(N, i));
+}
+
+/* ─── Engine: single function handles both baseline (jumps=[]) and jump cases ─── */
+function runEngine(currentWealth, targetWealth, months, mu_annual, sigma_annual, jumps) {
+  const N = 200;
+  const ALLOC = 10;
+  const dt = 1 / 12;
+  const mu_m    = mu_annual    * dt;
+  const sigma_m = sigma_annual * Math.sqrt(dt);
+  const logMax  = Math.log(targetWealth);
+
+  // Log-spaced centers
+  const centers = new Float64Array(N + 1);
+  for (let i = 1; i <= N; i++) centers[i] = Math.exp(i * logMax / N);
+  centers[0] = 0;
+
+  // Midpoint bucket boundaries
+  const bounds = new Float64Array(N + 1);
+  for (let i = 0; i < N; i++) bounds[i] = (centers[i] + centers[i + 1]) / 2;
+  bounds[N] = Infinity;
+
+  // Starting bucket
+  let start_idx = 1, min_diff = Infinity;
+  for (let i = 1; i <= N; i++) {
+    const d = Math.abs(centers[i] - currentWealth);
+    if (d < min_diff) { min_diff = d; start_idx = i; }
+  }
+
+  // Jump monthly probabilities
+  const jumpEvents = jumps.map(j => ({
+    lossFactor: 1 - j.loss,
+    prob: dt / j.freqYears,          // (1/12) / freqYears = monthly Poisson prob
+  }));
+  const probAnyJump = jumpEvents.reduce((s, je) => s + je.prob, 0);
+  const probNoJump  = Math.max(0, 1 - probAnyJump);
+
+  // Build sparse TPM — for each source bucket i and allocation a,
+  // accumulate: baseline prob → dest j (scaled by probNoJump),
+  //             jump prob    → getBucketIndex(centers[j]*lossFactor) (scaled by jump.prob)
+  const tpm = [];
+  for (let a = 0; a <= ALLOC; a++) {
+    const u  = a / ALLOC;
+    const mp = u * mu_m;
+    const sp = u * sigma_m;
+    const rows = [];
+    rows.push({ idx: [0], p: [1] }); // absorbing ruin state (bucket 0)
+
+    for (let i = 1; i <= N; i++) {
+      const c   = centers[i];
+      const acc = new Map();           // dest bucket → accumulated prob
+
+      for (let j = 0; j <= N; j++) {
+        const lower_ret = j === 0 ? -Infinity : (bounds[j - 1] - c) / c;
+        const upper_ret = (bounds[j] - c) / c;         // bounds[N]=Inf gives Inf ✓
+
+        let p_base;
+        if (sp === 0) {
+          p_base = (mp > lower_ret && mp <= upper_ret) ? 1 : 0;
+        } else {
+          p_base = normalCDF(upper_ret, mp, sp) - normalCDF(lower_ret, mp, sp);
+        }
+
+        if (p_base > 1e-12) {
+          // No-jump: market moved to bucket j
+          acc.set(j, (acc.get(j) || 0) + p_base * probNoJump);
+
+          // Each jump: market moved to j, then jump depletes wealth to centers[j]*lossFactor
+          for (const je of jumpEvents) {
+            const jIdx = getBucketIndex(centers[j] * je.lossFactor, N, logMax);
+            acc.set(jIdx, (acc.get(jIdx) || 0) + p_base * je.prob);
+          }
+        }
+      }
+
+      const idx = [], p = [];
+      for (const [j, prob] of acc) {
+        if (prob > 1e-12) { idx.push(j); p.push(prob); }
+      }
+      rows.push({ idx, p });
+    }
+    tpm.push(rows);
+  }
+
+  // Backward induction (Bellman)
+  let Vcurr = new Float64Array(N + 1);
+  for (let i = 0; i <= N; i++) Vcurr[i] = centers[i] >= targetWealth ? 1 : 0;
+
+  const Vt = new Float64Array(months + 1);
+  Vt[months] = Vcurr[start_idx];
+
+  let Vnext = new Float64Array(N + 1);
+  let Policy0 = null;
+
+  for (let t = months - 1; t >= 0; t--) {
+    const pol = t === 0 ? new Float64Array(N + 1) : null;
+    Vnext[0] = 0;
+    Vnext[N] = 1;
+
+    for (let i = 1; i < N; i++) {
+      let best_p = -1, best_a = 0;
+      for (let a = 0; a <= ALLOC; a++) {
+        const { idx, p } = tpm[a][i];
+        let ep = 0;
+        for (let k = 0; k < idx.length; k++) ep += p[k] * Vcurr[idx[k]];
+        if (ep > best_p) { best_p = ep; best_a = a; }
+      }
+      Vnext[i] = best_p;
+      if (pol) pol[i] = best_a;
+    }
+
+    Vt[t] = Vnext[start_idx];
+    if (pol) Policy0 = pol;
+    [Vcurr, Vnext] = [Vnext, Vcurr];
+  }
+
+  return {
+    probability:       Vcurr[start_idx],
+    initialAllocation: Policy0[start_idx] / ALLOC,
+    V0:      Array.from(Vcurr),
+    Policy0: Array.from(Policy0).map(v => v / ALLOC),
+    Vt:      Array.from(Vt),
+    centers: Array.from(centers),
+    N, months,
+  };
+}
+
+/* ─── Helpers ─── */
+const fmt$ = v => '$' + Math.round(v).toLocaleString();
+const fmtPct = (v, d = 1) => (v * 100).toFixed(d) + '%';
+const fmtDelta = v => (v >= 0 ? '−' : '+') + Math.abs(v * 100).toFixed(2) + ' pp';
+
+const BLUE   = '#38bdf8';
+const ORANGE = '#f97316';
+const AMBER  = '#f59e0b';
+const DGRID  = { color: 'rgba(255,255,255,0.05)' };
+const TCOL   = '#475569';
+const HTCOL  = '#94a3b8';
+
+function logXAxis(minVal) {
+  return {
+    type: 'logarithmic',
+    min: minVal,
+    title: { display: true, text: 'Wealth', color: HTCOL, font: { size: 11 } },
+    ticks: {
+      color: TCOL, maxTicksLimit: 7,
+      callback(v) {
+        if (v >= 1e6) return '$' + (v / 1e6).toFixed(v % 1e6 === 0 ? 0 : 1) + 'M';
+        if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+        return '$' + v;
+      },
+    },
+    grid: DGRID,
+  };
+}
+function pctYAxis(label) {
+  return {
+    min: 0, max: 1.05,
+    title: { display: true, text: label, color: HTCOL, font: { size: 11 } },
+    ticks: { color: TCOL, callback: v => fmtPct(v) },
+    grid: DGRID,
+  };
+}
+
+function buildDualChart(canvasRef, instRef, { base, jump, centers, vertX, yLabel, isAlloc }) {
+  if (instRef.current) instRef.current.destroy();
+
+  const xMin = Math.max(10_000, vertX / 200);
+  const pts  = (arr) => centers.slice(1).map((c, i) => ({ x: c, y: arr[i + 1] }));
+
+  instRef.current = new Chart(canvasRef.current, {
+    type: 'scatter',
+    data: {
+      datasets: [
+        {
+          label: 'Baseline',
+          data: pts(base),
+          borderColor: BLUE,
+          backgroundColor: BLUE + '18',
+          borderWidth: 2,
+          pointRadius: 0,
+          showLine: true,
+          fill: isAlloc ? false : 'origin',
+          tension: 0.2,
+          order: 2,
+        },
+        {
+          label: 'With Jumps',
+          data: pts(jump),
+          borderColor: ORANGE,
+          backgroundColor: ORANGE + '18',
+          borderWidth: 2,
+          pointRadius: 0,
+          showLine: true,
+          fill: isAlloc ? false : 'origin',
+          tension: 0.2,
+          order: 1,
+        },
+        {
+          label: '_marker',
+          data: [{ x: vertX, y: 0 }, { x: vertX, y: 1.05 }],
+          borderColor: AMBER,
+          borderWidth: 1.5,
+          borderDash: [5, 3],
+          pointRadius: 0,
+          showLine: true,
+          fill: false,
+          order: 0,
+        },
+      ],
+    },
+    options: {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: true,
+      aspectRatio: 2.8,
+      plugins: {
+        legend: {
+          display: true,
+          labels: {
+            color: HTCOL,
+            font: { size: 11 },
+            boxWidth: 14,
+            filter: item => item.text !== '_marker',
+          },
+        },
+        tooltip: {
+          filter: item => item.dataset.label !== '_marker',
+          callbacks: {
+            label: ctx => `${fmt$(ctx.parsed.x)}  →  ${fmtPct(ctx.parsed.y, 2)}`,
+          },
+        },
+      },
+      scales: { x: logXAxis(xMin), y: pctYAxis(yLabel) },
+    },
+  });
+}
+
+function buildTimeChart(canvasRef, instRef, { baseVt, jumpVt, months }) {
+  if (instRef.current) instRef.current.destroy();
+  const pts = (arr) => arr.map((v, t) => ({ x: +(t / 12).toFixed(3), y: v }));
+
+  instRef.current = new Chart(canvasRef.current, {
+    type: 'scatter',
+    data: {
+      datasets: [
+        {
+          label: 'Baseline',
+          data: pts(baseVt),
+          borderColor: BLUE,
+          backgroundColor: BLUE + '18',
+          borderWidth: 2,
+          pointRadius: 0,
+          showLine: true,
+          fill: 'origin',
+          tension: 0.2,
+        },
+        {
+          label: 'With Jumps',
+          data: pts(jumpVt),
+          borderColor: ORANGE,
+          backgroundColor: ORANGE + '18',
+          borderWidth: 2,
+          pointRadius: 0,
+          showLine: true,
+          fill: 'origin',
+          tension: 0.2,
+        },
+      ],
+    },
+    options: {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: true,
+      aspectRatio: 2.8,
+      plugins: {
+        legend: {
+          display: true,
+          labels: { color: HTCOL, font: { size: 11 }, boxWidth: 14 },
+        },
+        tooltip: {
+          callbacks: { label: ctx => `${ctx.parsed.x.toFixed(1)} yr  →  ${fmtPct(ctx.parsed.y, 2)}` },
+        },
+      },
+      scales: {
+        x: {
+          title: { display: true, text: 'Time Elapsed (years)', color: HTCOL, font: { size: 11 } },
+          ticks: { color: TCOL },
+          grid: DGRID,
+        },
+        y: pctYAxis('P(Success)'),
+      },
+    },
+  });
+}
+
+/* ─── Toggle component ─── */
+function Toggle({ checked, onChange, label }) {
+  const id = label.replace(/\s+/g, '-');
+  return (
+    <label className="toggle" htmlFor={id} style={{ cursor: 'pointer' }}>
+      <input id={id} type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} />
+      <span className="toggle-track" />
+      <span className="toggle-thumb" />
+      <span className="toggle-label">{checked ? 'Enabled' : 'Disabled'}</span>
+    </label>
+  );
+}
+
+/* ─── Jump section component ─── */
+function JumpSection({ label, color, jump, onChange }) {
+  return (
+    <div style={{
+      border: `1px solid ${jump.enabled ? color + '40' : 'rgba(255,255,255,0.06)'}`,
+      borderRadius: 8, padding: '12px', marginBottom: 10,
+      background: jump.enabled ? color + '08' : 'transparent',
+      transition: 'all 0.2s',
+    }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: jump.enabled ? 10 : 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: jump.enabled ? color : '#475569' }}>{label}</div>
+        <Toggle
+          checked={jump.enabled}
+          onChange={v => onChange({ ...jump, enabled: v })}
+          label={label}
+        />
+      </div>
+      {jump.enabled && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>Frequency</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <input
+                type="number" min="0.5" max="200" step="0.5"
+                value={jump.freqYears}
+                onChange={e => onChange({ ...jump, freqYears: +e.target.value })}
+              />
+              <span style={{ fontSize: 11, color: '#475569', whiteSpace: 'nowrap' }}>yr</span>
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: '#64748b', marginBottom: 4 }}>Depletion</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+              <input
+                type="number" min="1" max="99" step="1"
+                value={Math.round(jump.loss * 100)}
+                onChange={e => onChange({ ...jump, loss: +e.target.value / 100 })}
+              />
+              <span style={{ fontSize: 11, color: '#475569' }}>%</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Metric card ─── */
+function MetricCard({ label, value, color, sub, dim = false }) {
+  return (
+    <div style={{
+      background: dim ? 'rgba(255,255,255,0.02)' : 'rgba(255,255,255,0.04)',
+      border: `1px solid ${color}33`,
+      borderRadius: 10, padding: '14px 16px',
+    }}>
+      <div style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 32, fontWeight: 700, color: dim ? '#475569' : color, fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.02em' }}>{value}</div>
+      {sub && <div style={{ fontSize: 10, color: '#475569', marginTop: 4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/* ─── Chart card ─── */
+function ChartCard({ title, canvasRef }) {
+  return (
+    <div style={{ background: 'rgba(255,255,255,0.025)', border: '1px solid rgba(255,255,255,0.06)', borderRadius: 10, padding: '14px 16px', marginBottom: 14 }}>
+      <div style={{ fontSize: 11, color: '#64748b', fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>{title}</div>
+      <canvas ref={canvasRef} />
+    </div>
+  );
+}
+
+/* ─── Field wrapper ─── */
+function Field({ label, children }) {
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 12, color: '#94a3b8', fontWeight: 500, marginBottom: 6 }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+
+/* ─── Main App ─── */
+function App() {
+  const [horizon,     setHorizon]     = useState(10);
+  const [beginWealth, setBeginWealth] = useState(1_500_000);
+  const [endWealth,   setEndWealth]   = useState(3_500_000);
+  const [muScale,     setMuScale]     = useState(1.0);
+
+  const [jump1, setJump1] = useState({ enabled: true,  freqYears: 15, loss: 0.40 });
+  const [jump2, setJump2] = useState({ enabled: true,  freqYears: 25, loss: 0.20 });
+
+  const [baseResult, setBaseResult] = useState(null);
+  const [jumpResult, setJumpResult] = useState(null);
+  const [computing,  setComputing]  = useState(false);
+  const [error,      setError]      = useState(null);
+
+  const mu    = parseFloat((0.08 * muScale).toFixed(4));
+  const sigma = parseFloat((0.15 * muScale).toFixed(4));
+
+  const c1Ref = useRef(null); const c1Inst = useRef(null);
+  const c2Ref = useRef(null); const c2Inst = useRef(null);
+  const c3Ref = useRef(null); const c3Inst = useRef(null);
+
+  const handleSolve = useCallback(() => {
+    if (beginWealth <= 0 || endWealth <= beginWealth || horizon <= 0) {
+      setError('Target wealth must exceed starting wealth, and horizon must be positive.');
+      return;
+    }
+    setError(null);
+    setComputing(true);
+    setBaseResult(null);
+    setJumpResult(null);
+    setTimeout(() => {
+      try {
+        const months = Math.round(horizon * 12);
+        const activeJumps = [jump1, jump2].filter(j => j.enabled && j.freqYears > 0);
+        const base = runEngine(beginWealth, endWealth, months, mu, sigma, []);
+        const jump = runEngine(beginWealth, endWealth, months, mu, sigma, activeJumps);
+        setBaseResult(base);
+        setJumpResult(jump);
+      } catch (e) {
+        setError(e.message);
+      }
+      setComputing(false);
+    }, 10);
+  }, [beginWealth, endWealth, horizon, mu, sigma, jump1, jump2]);
+
+  useEffect(() => {
+    if (!baseResult || !jumpResult) return;
+    const { centers } = baseResult;
+
+    buildDualChart(c1Ref, c1Inst, {
+      base:    baseResult.V0,
+      jump:    jumpResult.V0,
+      centers, vertX: beginWealth,
+      yLabel: 'P(Success)',
+      isAlloc: false,
+    });
+    buildDualChart(c2Ref, c2Inst, {
+      base:    baseResult.Policy0,
+      jump:    jumpResult.Policy0,
+      centers, vertX: beginWealth,
+      yLabel: 'Equity Allocation',
+      isAlloc: true,
+    });
+    buildTimeChart(c3Ref, c3Inst, {
+      baseVt: baseResult.Vt,
+      jumpVt: jumpResult.Vt,
+      months: baseResult.months,
+    });
+  }, [baseResult, jumpResult, beginWealth]);
+
+  useEffect(() => () => [c1Inst, c2Inst, c3Inst].forEach(r => r.current?.destroy()), []);
+
+  const delta = baseResult && jumpResult ? baseResult.probability - jumpResult.probability : null;
+
+  const pBase  = baseResult  ? baseResult.probability  : 0;
+  const pJump  = jumpResult  ? jumpResult.probability  : 0;
+
+  const baseColor  = baseResult  ? pBase  > 0.8 ? '#4ade80' : pBase  > 0.5 ? '#fbbf24' : '#f87171' : BLUE;
+  const jumpColor  = jumpResult  ? pJump  > 0.8 ? '#4ade80' : pJump  > 0.5 ? '#fbbf24' : '#f87171' : ORANGE;
+
+  const anyJumpEnabled = jump1.enabled || jump2.enabled;
+
+  return (
+    <div style={{ maxWidth: 1120, margin: '0 auto', padding: '30px 20px' }}>
+
+      {/* Header */}
+      <div style={{ marginBottom: 28 }}>
+        <h1 style={{ fontSize: 22, fontWeight: 700, color: '#f1f5f9', letterSpacing: '-0.02em' }}>
+          HJB — Jump-Adjusted Probability of Success
+        </h1>
+        <p style={{ fontSize: 13, color: '#475569', marginTop: 4 }}>
+          Hamilton–Jacobi–Bellman DP with Poisson jump events · Divorce &amp; health crisis scenarios
+        </p>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '270px 1fr', gap: 22, alignItems: 'start' }}>
+
+        {/* ── Controls ── */}
+        <div style={{ background: 'rgba(255,255,255,0.035)', border: '1px solid rgba(255,255,255,0.07)', borderRadius: 12, padding: 18 }}>
+
+          <div style={{ fontSize: 10, color: '#475569', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 16 }}>
+            Market Parameters
+          </div>
+
+          <Field label="Horizon">
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input type="number" min="1" max="50" value={horizon}
+                onChange={e => setHorizon(+e.target.value)} style={{ width: 72 }} />
+              <span style={{ fontSize: 12, color: '#475569' }}>yr → {Math.round(horizon * 12)} mo</span>
+            </div>
+          </Field>
+
+          <Field label="Starting Wealth">
+            <input type="number" min="1" value={beginWealth} onChange={e => setBeginWealth(+e.target.value)} />
+            <div style={{ fontSize: 11, color: '#475569', marginTop: 3 }}>{fmt$(beginWealth)}</div>
+          </Field>
+
+          <Field label="Target Wealth">
+            <input type="number" min="1" value={endWealth} onChange={e => setEndWealth(+e.target.value)} />
+            <div style={{ fontSize: 11, color: '#475569', marginTop: 3 }}>{fmt$(endWealth)}</div>
+          </Field>
+
+          <Field label="Return Assumptions">
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+              <span style={{ fontSize: 12, color: '#7dd3fc', fontFamily: 'monospace' }}>μ = {fmtPct(mu)}</span>
+              <span style={{ fontSize: 12, color: '#fb923c', fontFamily: 'monospace' }}>σ = {fmtPct(sigma)}</span>
+            </div>
+            <input type="range" min="0.25" max="2.0" step="0.05" value={muScale}
+              onChange={e => setMuScale(+e.target.value)} />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: '#334155', marginTop: 4 }}>
+              <span>2% / 3.8%</span>
+              <span style={{ color: '#475569' }}>8% / 15% ●</span>
+              <span>16% / 30%</span>
+            </div>
+          </Field>
+
+          <div style={{ borderTop: '1px solid rgba(255,255,255,0.07)', margin: '16px 0 14px' }} />
+
+          <div style={{ fontSize: 10, color: '#475569', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.12em', marginBottom: 12 }}>
+            Jump Events
+          </div>
+
+          <JumpSection label="Divorce" color={ORANGE} jump={jump1} onChange={setJump1} />
+          <JumpSection label="Health Crisis" color="#a78bfa" jump={jump2} onChange={setJump2} />
+
+          <button
+            onClick={handleSolve}
+            disabled={computing}
+            style={{
+              width: '100%', marginTop: 8, padding: '10px 0',
+              background: computing ? 'rgba(125,211,252,0.1)' : 'rgba(125,211,252,0.15)',
+              border: '1px solid rgba(125,211,252,0.35)', borderRadius: 8,
+              color: computing ? 'rgba(125,211,252,0.5)' : '#7dd3fc',
+              fontWeight: 600, fontSize: 14, cursor: computing ? 'wait' : 'pointer',
+              transition: 'all 0.15s',
+            }}
+          >
+            {computing ? 'Computing two scenarios…' : 'Solve'}
+          </button>
+
+          {error && (
+            <div style={{ marginTop: 10, fontSize: 12, color: '#f87171', background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.2)', borderRadius: 6, padding: '8px 10px' }}>
+              {error}
+            </div>
+          )}
+        </div>
+
+        {/* ── Results ── */}
+        <div>
+          {!baseResult && !computing && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 280, color: '#1e293b', fontSize: 14 }}>
+              Set parameters and press Solve
+            </div>
+          )}
+
+          {computing && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 280, color: '#7dd3fc', fontSize: 14 }}>
+              Running baseline + jump scenario backward induction…
+            </div>
+          )}
+
+          {baseResult && jumpResult && (
+            <>
+              {/* Metrics */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 18 }}>
+                <MetricCard
+                  label="Baseline P(Success)"
+                  value={fmtPct(baseResult.probability, 2)}
+                  color={baseColor}
+                  sub={`No jump events · ${fmt$(beginWealth)} → ${fmt$(endWealth)}`}
+                />
+                <MetricCard
+                  label={anyJumpEnabled ? 'Jump-Adjusted P(Success)' : 'With Jumps (none active)'}
+                  value={fmtPct(jumpResult.probability, 2)}
+                  color={anyJumpEnabled ? jumpColor : '#475569'}
+                  sub={
+                    [jump1.enabled && `Divorce ${Math.round(jump1.freqYears)}yr/${Math.round(jump1.loss*100)}%`,
+                     jump2.enabled && `Health ${Math.round(jump2.freqYears)}yr/${Math.round(jump2.loss*100)}%`]
+                    .filter(Boolean).join(' · ') || 'No jumps enabled'
+                  }
+                  dim={!anyJumpEnabled}
+                />
+                <MetricCard
+                  label="Jump Cost"
+                  value={delta !== null ? fmtDelta(delta) : '—'}
+                  color={delta > 0.005 ? '#f87171' : delta > 0 ? '#fbbf24' : '#4ade80'}
+                  sub={delta !== null
+                    ? delta > 0.001 ? 'Jumps reduce your probability of success'
+                    : 'Minimal jump impact at these parameters'
+                    : ''}
+                  dim={!anyJumpEnabled || delta < 0.0005}
+                />
+              </div>
+
+              {/* Charts */}
+              <ChartCard
+                title={`P(Success) by Starting Wealth  ·  ${BLUE === '#38bdf8' ? '■' : ''} Baseline vs. ■ With Jumps`}
+                canvasRef={c1Ref}
+              />
+              <ChartCard
+                title="Optimal Equity Allocation by Starting Wealth"
+                canvasRef={c2Ref}
+              />
+              <ChartCard
+                title={`P(Success) vs. Time Elapsed  ·  starting at ${fmt$(beginWealth)}`}
+                canvasRef={c3Ref}
+              />
+            </>
+          )}
+        </div>
+      </div>
+
+      <div style={{ marginTop: 30, fontSize: 11, color: '#1e293b', textAlign: 'center' }}>
+        Dan Santner · JHU SDE · HJB Dynamic Programming with Jump Diffusion
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
