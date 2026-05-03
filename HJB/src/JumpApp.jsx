@@ -7,7 +7,7 @@ Chart.register(...registerables);
 const { solveProbabilityOfSuccess } = jumpengine;
 
 // N that balances fidelity vs. browser speed (jumpengine uses dense 3-D TPM)
-const N_BUCKETS   = 300;
+const N_BUCKETS   = 1000;
 const ALLOC_STEPS = 10;
 
 const fmt$ = v => '$' + Math.round(v).toLocaleString();
